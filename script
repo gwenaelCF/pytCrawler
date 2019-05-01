@@ -1,0 +1,586 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+### mise à jour de la liste des films du jeu Monsieur Cinéma sur forum.ubuntu-fr ###
+#
+# misajourv1.py
+#
+# python2.7
+#    dep :  mechanize
+#           imdbpy
+#           (merci à leurs développeurs)
+# un fichier joint pour accéder au compte
+# un fichier créé si besoin pour sauvegarder la liste
+#
+# licence internationale DTFWYW
+# licence fr SCVSVPTPUB
+
+import urllib2
+import locale
+import re
+import time
+import mechanize
+import htmlentitydefs
+import unicodedata
+from random import choice
+from imdb import IMDb
+
+version = 'v1.3.0'
+
+locale.setlocale(locale.LC_ALL,'fr_FR.utf8')
+
+def cleanString(s):
+    if isinstance(s,str):
+        s = unicode(s,"utf-8","replace")
+    s=unicodedata.normalize('NFD',s)
+    return s
+
+def compare (a, b):
+    # pour épurer et trier les titres
+    a = a.lstrip()
+    b = b.lstrip()
+    if a[0] == '(':
+        a = a.split(')')[1]
+    if b[0] == '(':
+        b = b.split(')')[1]
+    a = a.lstrip()
+    b = b.lstrip()
+    return locale.strcoll(a, b)
+
+
+def unescape(text):
+    #    code html -> unicode   fonction trouvée sur le net
+    def fixup(m):
+        text = m.group(0)
+        if text[:2] == "&#":
+            # character reference
+            try:
+                if text[:3] == "&#x":
+                    return unichr(int(text[3:-1], 16))
+                else:
+                    return unichr(int(text[2:-1]))
+            except ValueError:
+                pass
+        else:
+            # named entity
+            try:
+                text = unichr(htmlentitydefs.name2codepoint[text[1:-1]])
+            except KeyError:
+                pass
+        return text # leave as is
+    return re.sub("&#?\w+;", fixup, text)
+
+def trialpha(liste) :
+    # tri par ordre alphabétique la liste brute
+    dicfilm = {}
+    trukipasspa = {ord(u'\u0152'):u'oe' , ord(u'\u0153'):u'oe'}
+    
+    for i in liste:
+        i = i.lstrip().rstrip()
+        if i[0] == '(':
+            a = i.split(')')[1]
+            a = cleanString(a.lstrip())
+        else : 
+            a = cleanString(i)
+        a = a.translate(trukipasspa)
+        dicfilm[i]= a[0].lower()
+
+    liste_alpha = []
+    for i in range(28) :
+            liste_alpha.append([])
+            
+    alfab = 'abcdefghijklmnopqrstuvwxyz'
+    for i in dicfilm.items():
+        if i[1] in alfab :
+            liste_alpha[alfab.index(i[1])+1].append(i[0])
+        elif i[1].isdigit() :
+            liste_alpha[0].append(i[0])
+        else :
+            liste_alpha[27].append(i[0])
+
+    #liste_globale = [j for i in liste_alpha for j in i]
+    for i in range(28):
+        liste_alpha[i].sort(cmp=compare)
+        
+    liste_imprim = u'[center][b]N°[/b][/center]\n[code]'+(u' | ').join(liste_alpha[0])+u'''[/code]\n\n'''
+    nbr = 1
+    for i in 'abcdefghijklmnopqrstuvwxyz?'.upper():
+        liste_imprim += u'[center][b]'+i+u'[/b][/center]\n[code]'+(u' | ').join(liste_alpha[nbr])+u'''[/code]\n\n'''
+        nbr+=1
+
+    return liste_imprim.encode('utf8')
+
+def recupost(urltopic) :
+    # récupère le deuxième message du topique et en extrait
+    #   la liste actuelle, les codes imdb déjà utilisés, l'id du post, la dernière page parcourue
+    print 'récupération du message-liste'
+    print urltopic
+    for i in range(5):
+        try:
+            pageraw = mechanize.urlopen(urltopic)
+            print 'première page récupérée '+urltopic
+            break
+        except:
+            print 'récupération échouée, nouvelle tentative dans 3 secondes'
+            if i==4:
+                print 'échec de la récupération - sortie'
+                raise
+            time.sleep(3)
+    
+    page = pageraw.read()
+
+    pageraw.close()
+    
+    #print page
+    imdrex = re.compile('\<code>\[imdb\sliste\](.*?)\[/imdb\]</code>')
+    listrex = re.compile('<p style="text-align: center"><strong>.*?</strong></p><div class="codebox"><pre><code>(.*?)</code></pre></div>')
+    numprex = re.compile('la page #([\d]+)')
+    postex = re.compile('<div id="p(\d+)"\sclass=')
+    
+    if imdrex.search(page):
+        liste_imdb = imdrex.search(page).group(1)
+        liste_imdb = liste_imdb.split()
+    else :
+        print 'liste imdb absente ?'
+        liste_imdb = []
+   
+    liste_titres = []
+    if listrex.search(page) :
+        for i in listrex.findall(page) :
+            liste_titres += unescape(i.decode('utf8')).split(' | ')
+    else :
+        print 'liste de titres absente ?'
+    
+    if postex.search(page) :
+        postid = postex.findall(page)[1]
+    else :
+        print 'ID du post introuvable'
+        postid = 0
+        #raise
+
+    if numprex.search(page) :
+        numpage = numprex.search(page).group(1)
+    else :
+        print 'n° de dernière page mise à jour non trouvée, placé à 1 par défaut'
+        numpage = 1
+            
+    print '\n message récupéré pour mise à jour\n'  
+    return liste_imdb, liste_titres, postid, numpage
+
+
+def recupbalise(numpage, url, old_imdb) :
+    # retourne  les balises des films trouvés à rajouter
+    #           la dernière page farfouillée
+    #           le nouvel url, si le topic est fermé
+    #           le dernier film trouvé
+    listall = []
+    dernier = ['','',0]
+    newurl = url
+    numpage = int(numpage)
+    suivex = re.compile('>Suiv.</a>')
+    titrex = re.compile('[\[imdb\]|\[*\]](tt\d+)[\[/imdb\]|\[/*\]]', re.I)
+    closerex = re.compile('<p class="postlink conr">Discussion fermée</p>')
+    postmsrex = re.compile('<div class="postmsg">(.*?)</div>', re.DOTALL)
+    linkrex = re.compile('<a href="(.*?)">')
+    
+    while numpage < 300 : # limite non-nécessaire si le code n'est pas beugué, mieux vaut prévenir...
+        print 'recherche des codes imdb sur la page '+str(numpage)
+        print url+'&p='+str(numpage)
+        for i in range(5):
+            try :
+                pageraw = mechanize.urlopen(url+'&p='+str(numpage))
+                break
+            except :    
+                if i==4:
+                    print 'échec de connection avec le forum - sortie'
+                    raise
+                print 'page du forum inaccessible - nouvelle tentative dans 3 secondes'
+                time.sleep(3)
+                
+        page = pageraw.read()
+        pageraw.close()
+        
+        titre = []
+        [titre.append(x) for x in titrex.findall(page)\
+         if (x not in old_imdb and x not in titre)]
+        if titre :
+            dernier[1] = titre[-1]
+            dernier[2] = numpage
+        print titre
+        [listall.append(x) for x in titre if x not in listall]
+        
+        if suivex.search(page) :
+            numpage +=1
+        else:            
+            if closerex.search(page) :
+                print '\ntopic fermé, recherche du nouveau topic'
+                posts = postmsrex.findall(page)
+                lastpost = posts[-1]
+                print lastpost
+                if linkrex.search(lastpost) :
+                    numpage = 1
+                    newurl = linkrex.search(lastpost).group(1)
+                    print 'Nouveau topic détecté: '+newurl
+                else :
+                    print "Topique détecté fermé, mais pas de nouveau url ?"                
+                    break
+            break
+    
+
+    return numpage, listall, newurl, dernier
+
+
+def titrimdb(films, dernier):
+    # cherche les titres des films en fonction de leur numéro imdb
+    # grâce à imdbpy
+    print '\nrecherche des titres des nouveaux films sur imdb\nvia imdbpy'
+    print films
+    nouvfilm = []
+	
+    for i in films:
+        print 'Balise '+i+' : ',
+        if i[:2] == 'tt' :
+            i = i[2:]
+        ia = IMDb()
+        movie = ia.get_movie(i) 
+        titre = movie['title']+' ('+str(movie['year'])+')' 
+        print titre
+        nouvfilm.append((i, titre))
+        if i == dernier[1] : 
+            dernier[0] = titre
+
+    print 'recherche imdb terminée' 
+    if nouvfilm == []:
+        print 'pas de nouveau film, donc'
+    else :
+        print '\ntitres ajoutés :'
+        print [t for (i, t) in nouvfilm]
+    return nouvfilm, dernier
+
+
+def message(liste_imdb, liste_titres, nbr_titres, numpage, dernier, picfilm):
+    # façonne le nouveau message-liste
+    texte = """[b]LISTE DES FILMS DÉJÀ CITÉS :[/b]
+
+~+~+~+~+~+~+~+~+~
+Dernière mise à jour de la Liste : """
+    texte += time.strftime('le %d/%m/%Y, à %H:%M:%S (GMT)',time.gmtime())
+    texte += """, jusqu'à la page #"""
+    texte += str(numpage)
+    texte += """
+Dernier film ajouté : """
+    texte += dernier[0].encode('utf8')
+    texte += """  [i]balise """
+    texte += dernier[1] + ", page "
+    texte += str(dernier[2])+"""[/i]
+Nombre de films trouvés : """
+    texte += str(nbr_titres)
+    texte += """
+~+~+~+~+~+~+~+~+~
+     
+"""
+    texte += trialpha(liste_titres)
+    texte += """
+
+Liste des balises utilisées[code][imdb liste]"""
+    texte += liste_imdb.encode('utf8')
+    texte += """[/imdb][/code]"""
+    texte += picfilm.encode('utf8')
+    #texte.decode('utf8')
+    return texte
+
+def notification(numpage, new_numpage, new_film):
+	#façonne le message de notification de mise à jour
+    texte = """Bonjour,
+mise à jour effectuée depuis la page """
+    texte += str(numpage)
+    texte += """ jusqu'à la page """
+    texte += str(new_numpage)
+    texte += """
+    
+    """
+    texte += choice(["j'balise !", "Merci de signaler les erreurs",\
+     "ça va sinon ?", "Winter is coming.", "Merci d'errer les signalements"])
+    texte += """[code]"""
+    for i in new_film :
+        texte += """
+    Balise """
+        texte += i[0].encode('utf8')
+        texte += """ : """
+        texte += i[1].encode('utf8')
+    texte += """[/code]"""
+    
+    return texte
+    
+def modifpost(msg, msg2, login, password, postid, tid):
+    # envoie les messages - liste + notification
+    print 'envoi des post en cours...'
+    cookieJar = mechanize.CookieJar()
+    opener = mechanize.build_opener(mechanize.HTTPCookieProcessor(cookieJar))
+    opener.addheaders = [("User-agent","Mozilla/5.0")]
+    mechanize.install_opener(opener)
+    
+    fp = mechanize.urlopen("http://forum.ubuntu-fr.org/login.php")
+    forms = mechanize.ParseResponse(fp)
+    fp.close()
+    
+    #print forms[1]
+    form = forms[1]
+    form["req_username"] = login
+    form["req_password"] = password
+    fp = mechanize.urlopen(form.click())
+    fp.close()
+    # modifie le post liste
+    for i in range(5) :
+        try :
+            print 'modification du post-liste'            
+            print 'opening http://forum.ubuntu-fr.org/edit.php?id='+str(postid)
+            fp = mechanize.urlopen('http://forum.ubuntu-fr.org/edit.php?id='+str(postid))
+            forms = mechanize.ParseResponse(fp)
+            fp.close()
+            form = forms[1]
+            form["req_message"] = msg
+            fp = mechanize.urlopen(form.click())
+            fp.close()
+            print 'modification faite'
+            break
+        except:
+            print 'post échoué, nouvelle tentative dans 3 secondes'
+            if i==4:
+                print 'échec - sortie'
+                raise
+            time.sleep(3)
+    
+    #notifie la mise à jour
+    for i in range(5) :
+        try :
+            print "envoi du post signalant les ajouts"
+            print 'opening http://forum.ubuntu-fr.org/post.php?tid='+tid
+            fp2 = mechanize.urlopen('http://forum.ubuntu-fr.org/post.php?tid='+tid)
+            forms2 = mechanize.ParseResponse(fp2)
+            fp2.close()
+            form2 = forms2[1]
+            form2["req_message"] = msg2
+            fp2 = mechanize.urlopen(form2.click())
+            fp2.close()
+            print 'envoi réalisé'
+            break
+        except:
+            print 'post échoué, nouvelle tentative dans 3 secondes'
+            if i==4:
+                print 'échec - sortie'
+                raise
+            time.sleep(3)
+
+
+def modiflocal(msg):
+    # pour un test en local et la sauvegarde
+    try :
+        with open('liste.bak', 'w') as f :
+            f.write(msg)
+        print 'ok, liste.bak mis à jour'
+    except :
+        print 'sauvegarde locale impossible'
+  
+def recupostID(urltopic) :
+    postex = re.compile('<div id="p(\d+)"\sclass=')
+    for i in range(5):
+        try:
+            pageraw = mechanize.urlopen(urltopic)
+            print 'page récupérée '+urltopic
+            break
+        except:
+            print 'récupération échouée, nouvelle tentative dans 3 secondes'
+            if i==4:
+                print 'échec de la récupération - sortie'
+                raise
+            time.sleep(3)
+    
+    page = pageraw.read().decode('utf-8')
+    pageraw.close()
+    
+    if postex.search(page) :
+        postid = postex.findall(page)[1]
+    else :
+        print 'ID du post introuvable'
+        raise
+    return postid
+
+def sendimage(url_server, url_image):
+    # envoie l'image sur un serveur
+    imrex = re.compile('\[img\](.*?)\[/img\]', re.I)
+	
+    print 'envoi de l\'image pour modif\' en ligne'
+    cookieJar = mechanize.CookieJar()
+	
+    opener = mechanize.build_opener(mechanize.HTTPCookieProcessor(cookieJar))
+    opener.addheaders = [("User-agent","Mozilla/5.0")]
+    mechanize.install_opener(opener)
+	
+    fp = mechanize.urlopen(url_server)
+    forms = mechanize.ParseResponse(fp)
+    fp.close()
+	    
+    form = forms[0]
+    print 'envoi du formulaire'
+    form["url_list"] = url_image
+    form["optsize"] = ['3']
+    form["adult"] = ["no"]
+    fp = mechanize.urlopen(form.click())
+    response = fp.read()
+    fp.close()
+    url_thumb = imrex.search(response).group(1)
+    print 'image réduite accessible : ' +url_thumb
+    return url_thumb
+    
+def getpic(titre):
+    # va chercher une pic !
+    print "recherche d'une image..."
+    imrex = re.compile('imgurl:&quot;(.*?)&quot;', re.I)
+    jeveurex = re.compile('gif|nopicture|youtube')
+    cookieJar = mechanize.CookieJar()
+    
+    opener = mechanize.build_opener(mechanize.HTTPCookieProcessor(cookieJar))
+    opener.addheaders = [("User-agent","Mozilla/5.0")]
+    mechanize.install_opener(opener)
+    
+    cherche = "http://www.bing.com/images/search?q=movie+"+'+'.join(titre.split())+"&adlt=off"
+    print cherche
+    fp = mechanize.urlopen(cherche)
+    response = fp.read()
+    fp.close()
+    
+    listall = imrex.findall(response)
+    
+    for i in range(len(listall)):
+        if jeveurex.search(listall[i]):
+            continue
+        else :
+            print listall[i]
+            ima = listall[i]
+            break
+    if ima :
+        return ima
+    else :
+        ima = 'http://clzimages.com/movie/large/43/43_d_46984_0_Python.jpg'
+        return ima
+
+def main():
+    # on y arrive... ###scinder en fonctions ? (cf picfilm)  ++options
+    print "mise à jour en cours... "+version
+    with open('tchernia','r') as f :
+        url_qfc = f.readline().rstrip('\n\r')
+        login = f.readline().rstrip('\n\r')
+        password = f.readline().rstrip('\n\r')
+    
+    try :
+        tid = url_qfc.split('=')[1].rstrip('&p')
+    except :
+        tid = 'ERROR : url invalide ?'
+    try :
+        urltopic = url_qfc.split('&')[0]
+    except :
+        urltopic = url_qfc
+    
+    print 'id du topic en cours = '+tid
+    print 'connection au compte M. Cinéma'
+    cookieJar = mechanize.CookieJar()
+    opener = mechanize.build_opener(mechanize.HTTPCookieProcessor(cookieJar))
+    opener.addheaders = [("User-agent","Mozilla/5.0")]
+    mechanize.install_opener(opener)
+    
+    fp = mechanize.urlopen("http://forum.ubuntu-fr.org/login.php")
+    forms = mechanize.ParseResponse(fp)
+    fp.close()
+    
+    print forms[1]
+    form = forms[1]
+    form["req_username"] = login
+    form["req_password"] = password
+    fp = mechanize.urlopen(form.click())
+    fp.close()
+
+    old_imdb, old_titres, postid, numpage = recupost(urltopic)
+    print 'page en cours = '+str(numpage)    
+    
+    new_numpage, new_imdb, newurl, dernier = recupbalise(numpage, url_qfc, old_imdb)
+    print 'page atteinte : '+str(new_numpage)+'\n'
+
+    if urltopic != newurl :
+        try :
+            tid = newurl.split('=')[1].rstrip('&p')
+        except :
+            print 'ERROR : nouvel url invalide ? '+newurl
+        print '\nTopic changé, recherche du nouveau post sur le topic '+tid
+        postid = recupost('http://forum.ubuntu-fr.org/viewtopic.php?id='+tid)[2]
+        print 'recherche des balises sur le nouveau topic'
+        new_numpage, new_imdb2, newurl, dernier = recupbalise(new_numpage, newurl, old_imdb)
+        new_imdb = new_imdb + new_imdb2
+        
+    if new_imdb != []:
+        new_film, dernier = titrimdb(new_imdb, dernier)
+    else :
+        print 'pas de nouveau film, sortie sans modification de la liste'
+        quit()
+    
+    new_imdb = old_imdb + new_imdb # ! modification après avoir récupéré les titres
+    new_liste = [t for (i, t) in new_film] + old_titres
+    new_liste = list(set(new_liste))
+    new_liste.sort(cmp=compare)
+    new_imdb.sort()
+    
+    if new_imdb :
+        imdb_str = ' '.join(new_imdb)
+    else :
+        imdb_str = ''
+    
+    nbr_titres = len(new_liste)
+
+    try :
+        cherchpic = choice(new_liste)
+    except :
+        print "bug python, choix annulé"
+        cherchpic = "python"
+    print "\nle choix du jour : "+cherchpic
+    try :
+        ima = urllib2.unquote(getpic(cleanString(cherchpic).encode("utf-8")))
+        thumb = sendimage('http://postimage.org/index.php?um=web', ima)
+        picfilm ="""
+    [center]un (quel)film(c) au hasard
+    [url="""+ima+"][img="+cherchpic+"]"+thumb+"[/img][/url][/center]"
+    except :
+        print "bug envoi image"
+        picfilm = " "
+    
+    
+    msg = message(imdb_str, new_liste, nbr_titres, new_numpage, dernier, picfilm)	
+    msg2 = notification(numpage, new_numpage, new_film)
+    
+    print '\nnouvelle liste créée \n'
+    print 'modification de la liste locale'
+    modiflocal(msg)
+
+    print '\nmessage à envoyer sur le fil'        
+    try :
+        if raw_input(msg2):
+            print "go go go"
+        modifpost(msg, msg2, login, password, postid, tid)
+    except :
+        print '\néchec des posts'
+        print 'sortie de la mise à jour'
+        quit()
+    
+    if urltopic != newurl :
+        print 'modification du fichier local avec la nouvelle url'
+        print newurl
+        with open('tchernia', 'r') as file :
+            tchernia = file.readlines()
+    
+        tchernia[0] = 'http://forum.ubuntu-fr.org/viewtopic.php?id='+tid+'\n'
+        with open('tchernia', 'w') as file :
+            file.writelines(tchernia)
+    print '\n ... mise à jour terminée '
+
+
+if __name__ == "__main__":
+    main()
